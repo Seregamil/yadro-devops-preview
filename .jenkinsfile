@@ -1,0 +1,139 @@
+def environmentAgents = [
+    [ name: "Python 2.7", image: "python:2.7-slim" ], 
+    [ name: "Python 3.2", image: "python:3.2-slim-internal", dockerfile: 'py3_2.dockerfile' ], 
+    [ name: "Python 3.6", image: "python:3.6-slim" ], 
+    [ name: "Python 3.8", image: "python:3.8-slim" ], 
+    [ name: "Latest Python", image: "python:latest" ] 
+]
+
+def lintTest = [
+    [ name: 'flake8', args: ['--format=pylint', '.'] ],
+    [ name: 'pylint', args: ['--output-format=text', '*.py'] ]
+]
+
+def parallelUnitTestsMap = environmentAgents.collectEntries {
+    ["Test's ${ it.name }": runUnitTest(it.name, it.image)]
+}
+
+def parallelLintsMap = [:]
+environmentAgents.each { agent -> 
+    lintTest.each { framework -> 
+        parallelLintsMap << [ "Lint \"${ framework.name }\" on ${ agent.name }": runSingleLint(framework, agent) ]
+    }
+}
+
+pipeline {
+    agent any
+    options {
+        timestamps()
+    }
+    stages {
+        stage('Prepare pipeline') {
+            steps {
+                script {
+                    environmentAgents.each { agent ->
+                        if(agent.dockerfile != null)
+                            docker.build(agent.image, "-f ${ agent.dockerfile } .")
+                    }
+
+                    stash name: "source-data", includes: "fibonacci/**/*.py"
+                }
+            }
+        }
+        stage('Code Lint') {
+            steps {
+                script {
+                    parallel parallelLintsMap
+                }
+            }
+        }
+
+        stage('Unit tests') {
+            // skip when UNSTABLE build state, but it's preview pipeline
+            steps {
+                script {
+                    parallel parallelUnitTestsMap
+                }
+            }
+        }
+
+        stage ('Call another pipeline') {
+            steps {
+                script {
+                    build job: 'echo'
+                }
+            }
+        }
+    }
+    post {
+        always {
+            cleanWs notFailBuild: true
+        }
+    }
+}
+
+def runUnitTest(String pythonVersion, String agentImage) {
+    return {
+        node {
+            docker.image(agentImage).inside() {
+                stage ("Unit tests for ${ pythonVersion }") {
+                    echo "Run unit tests on ${ agentImage } with image ${ pythonVersion }"
+
+                    cleanWs()
+                    unstash 'source-data'
+                    dir('fibonacci') {
+                        sh "ls"
+                        
+                        // it's demo code for preview
+                        try {
+                            sh "python -m unittest fib_test.TestFibonacci"
+                        } catch (Exception e) {
+                            unstable "\"Unit tests on ${ pythonVersion }\" failed"
+                        }
+
+                        /*
+                            // this code throws when any errors exists
+                            def script = "python -m unittest fib_test.TestFibonacci"
+                            sh script: returnStdout: true
+                        */
+                    }
+                }
+            }
+        }
+    }
+}
+
+def runSingleLint(Map framework, Map agent) {
+    return {
+        node {
+            docker.image(agent.image).inside() {
+                stage ("Lint by \"${ framework.name }\" on \"${ agent.image }\"") {
+                    echo "Run lint by \"${ framework.name }\" on \"${ agent.image }\""
+                    
+                    cleanWs()
+                    unstash 'source-data'
+
+                    // python:3 -> [0] = py, [1] = 3; [0] = '3'
+                    def pipVersion = agent.image.split(':')[1][0] == '3' ? 'pip3' : 'pip'
+
+                    if(agent.dockerfile == null)
+                        sh "${ pipVersion } install ${ framework.name }" // pip install flake8
+
+                    dir('fibonacci') {
+                        // it's demo code for preview
+                        try {
+                            sh "${ framework.name } ${ framework.args.join(' ') }" 
+                        } catch (Exception e) {
+                            unstable "\"${ framework.name }:${ agent.image }\" failed"
+                        }
+                    }
+                    /*
+                        // this code throws when any errors exists
+                        def script = "${ framework.name } ${ framework.args.join(' ') }" 
+                        sh script: returnStdout: true
+                    */
+                }
+            }
+        }
+    }
+}
